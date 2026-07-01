@@ -226,6 +226,8 @@ def _strip_html(html: str) -> str:
     text = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
     text = re.sub(r"<p[^>]*>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"</p>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<head[^>]*>.*?</head>", "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"&nbsp;", " ", text)
     text = re.sub(r"&amp;", "&", text)
@@ -233,6 +235,12 @@ def _strip_html(html: str) -> str:
     text = re.sub(r"&gt;", ">", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _is_html_body(body: str) -> bool:
+    """Return True if the body looks like an HTML document."""
+    stripped = body.strip().lower()
+    return stripped.startswith("<!doctype html") or stripped.startswith("<html")
 
 
 def _extract_email_address(raw: str) -> str:
@@ -879,11 +887,21 @@ class EmailAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send an email reply to the given address."""
+        """Send an email reply to the given address.
+
+        When the body is HTML (starts with <!doctype html or <html), the
+        email is sent as a fresh message with no threading headers so it
+        appears as its own thread in Gmail.
+
+        Pass ``metadata={"subject": "..."}`` to override the subject.
+        """
+        subject = metadata.get("subject") if metadata else None
+        if subject is None and _is_html_body(content):
+            subject = "Hermes Agent"
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to
+                None, self._send_email, chat_id, content, reply_to, subject
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -895,30 +913,52 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         reply_to_msg_id: Optional[str] = None,
+        subject: Optional[str] = None,
     ) -> str:
-        """Send an email via SMTP. Runs in executor thread."""
-        msg = MIMEMultipart()
+        """Send an email via SMTP. Runs in executor thread.
+
+        When *body* starts with ``<!doctype html`` or ``<html``, the email
+        is sent as ``multipart/alternative`` with both HTML and a plain-text
+        fallback (auto-stripped).  Otherwise it is sent as ``text/plain`` as
+        before, preserving backward compatibility with existing callers.
+        """
+        is_html = _is_html_body(body)
+
+        msg = MIMEMultipart("alternative" if is_html else "mixed")
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        # Thread context for reply
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
-        msg["Subject"] = subject
+        # Use explicit subject if provided, otherwise fall back to thread context
+        if subject:
+            msg["Subject"] = subject
+        else:
+            ctx = self._thread_context.get(to_addr, {})
+            subject = ctx.get("subject", "Hermes Agent")
+            if not subject.startswith("Re:"):
+                subject = f"Re: {subject}"
+            msg["Subject"] = subject
 
-        # Threading headers
-        original_msg_id = reply_to_msg_id or ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+        # Threading headers — only when replying to existing thread
+        if not subject or not msg["Subject"].startswith("Re:"):
+            # Fresh email — no threading headers
+            pass
+        else:
+            original_msg_id = reply_to_msg_id or self._thread_context.get(to_addr, {}).get("message_id")
+            if original_msg_id:
+                msg["In-Reply-To"] = original_msg_id
+                msg["References"] = original_msg_id
 
         msg["Date"] = formatdate(localtime=True)
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._address.split('@')[1]}>"
         msg["Message-ID"] = msg_id
 
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        if is_html:
+            # HTML email — attach HTML part first, then plain-text fallback
+            plain_body = _strip_html(body)
+            msg.attach(MIMEText(plain_body, "plain", "utf-8"))
+            msg.attach(MIMEText(body, "html", "utf-8"))
+        else:
+            msg.attach(MIMEText(body, "plain", "utf-8"))
 
         smtp = self._connect_smtp()
         try:
@@ -930,7 +970,8 @@ class EmailAdapter(BasePlatformAdapter):
             except Exception:
                 smtp.close()
 
-        logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, subject)
+        logger.info("[Email] Sent reply to %s (subject: %s%s)", to_addr, subject,
+                    ", HTML" if is_html else "")
         return msg_id
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
@@ -1167,11 +1208,18 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    email_subject=None,
 ):
     """Out-of-process Email delivery via SMTP (one-shot). Implements the
-    standalone_sender_fn contract; replaces the legacy _send_email helper."""
+    standalone_sender_fn contract; replaces the legacy _send_email helper.
+
+    When *message* starts with ``<!doctype html`` or ``<html``, the email
+    is sent as ``multipart/alternative`` with both HTML and a plain-text
+    fallback.  Otherwise it is sent as ``text/plain``.
+    """
     import smtplib
     import ssl as _ssl
+    from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
     from email.utils import formatdate
 
@@ -1187,11 +1235,39 @@ async def _standalone_send(
     if not all([address, password, smtp_host]):
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
+    # Detect HTML content — handle preamble text before <!doctype html
+    stripped = message.strip().lower()
+    start_idx = -1
+    doctype_idx = stripped.find("<!doctype html")
+    html_idx = stripped.find("<html")
+    if doctype_idx != -1 and (html_idx == -1 or doctype_idx < html_idx):
+        start_idx = doctype_idx
+        is_html = True
+    elif html_idx != -1:
+        start_idx = html_idx
+        is_html = True
+    else:
+        is_html = False
+
+    if is_html and start_idx > 0:
+        # Strip preamble text so email starts with HTML
+        message = message.strip()[start_idx:]
+
     try:
-        msg = MIMEText(message, "plain", "utf-8")
+        if is_html:
+            # HTML email — multipart/alternative with plain-text fallback
+            plain_body = _strip_html(message)
+            msg = MIMEMultipart("alternative")
+            msg.attach(MIMEText(plain_body, "plain", "utf-8"))
+            msg.attach(MIMEText(message, "html", "utf-8"))
+        else:
+            msg = MIMEText(message, "plain", "utf-8")
         msg["From"] = address
         msg["To"] = chat_id
-        msg["Subject"] = "Hermes Agent"
+        if email_subject:
+            msg["Subject"] = email_subject
+        else:
+            msg["Subject"] = "Hermes Agent"
         msg["Date"] = formatdate(localtime=True)
 
         server = smtplib.SMTP(smtp_host, smtp_port)
