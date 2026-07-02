@@ -430,6 +430,11 @@ def _extract_attachments(
 class EmailAdapter(BasePlatformAdapter):
     """Email gateway adapter using IMAP (receive) and SMTP (send)."""
 
+    # Email has no practical message length limit — bypass the gateway delivery
+    # layer's MAX_PLATFORM_OUTPUT truncation (4000 chars) so HTML emails and
+    # long cron reports are delivered in full.
+    splits_long_messages = True
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.EMAIL)
 
